@@ -5,13 +5,13 @@ Docker events to automatically attach to late started containers and upload the 
 configured central location.
 """
 import docker
-import sys
+import re
 import logging
-import datetime
+import sys
 
-from dateutil.parser import parse
 from docker_logger.adapter import adapter_factory
-from threading import Thread
+from dateutil.parser import parse
+from threading import Thread, Timer
 
 
 class DockerLogCapture(Thread):
@@ -38,7 +38,10 @@ class DockerLogCapture(Thread):
         self._log = logging.getLogger(__name__)
         self._container = container
         self._adapter = adapter
-        self._buffer = []
+        self._time_matcher = re.compile(r"(\d{4}(?:-\d{2}){2}T\d{2}(?::\d{2}){2}\.\d{9}[A-Z])+\s")
+        self._stream_buffer = ""
+        self._logs_buffer = []
+        self._flush_timer = None
 
     def run(self):
 
@@ -53,7 +56,15 @@ class DockerLogCapture(Thread):
             for line in self._container.logs(
                     stdout=True, stderr=True, stream=True, timestamps=True,
                     since=start_from.replace(tzinfo=None)):
-                self._print_log(line)
+
+                # cancel any log flush if there is anything running
+                self._cancel_log_flush()
+
+                # process any captured characters from the stream
+                self._process_log_stream(chars=line)
+
+                # start a new log flush cycle
+                self._trigger_log_flush()
 
         except KeyboardInterrupt:
             self._log.debug(
@@ -61,37 +72,68 @@ class DockerLogCapture(Thread):
             )
 
         finally:
+
+            # make sure that all the messages in the stream has been processed
+            self._cancel_log_flush()
+            self._process_log_stream(flush=True)
+
             self._log.debug(
                 "Docker log capture for container {} stopped".format(self._container.name)
             )
 
-    # function to print the logs being printed from a running container. The function currently
-    # only prints the captured logs to the stdout but this can easily be converted to work with
-    # the AWS CloudWatch APIs
-    def _print_log(self, message):
+    def _cancel_log_flush(self):
+        if self._flush_timer:
+            self._flush_timer.cancel()
+            self._flush_timer = None
 
-        is_last_message_incomplete = message[-1:] != "\n"
+    def _trigger_log_flush(self):
+        if not self._flush_timer:
+            self._flush_timer = Timer(0.2, self._process_log_stream, kwargs={"flush": True})
+            self._flush_timer.start()
 
-        # split the stream into individual lines, removing any empty lines but first append any
-        # previous messages that are in the buffer
-        log_lines = "{previous_message}{new_message}".format(
-            previous_message=self._buffer if self._buffer else "",
-            new_message=message if is_last_message_incomplete else message[:-1]
-        ).split("\n")
+    def _process_log_stream(self, chars="", flush=False):
+        """
+        Processes the incoming characters from the container stream. The characters will first be
+        appended to a buffer since they might be coming in small chunks and then the buffer is
+        scanned to extract each message
+        """
 
-        # if the last log entry is not complete keep it in the buffer for the next iteration
-        # of the log print
-        if is_last_message_incomplete:
-            self._buffer = log_lines[-1]
-            del log_lines[-1]
-        else:
-            self._buffer = None
+        # append the last received characters to the buffer
+        self._stream_buffer += chars
 
-        for log_line in log_lines:
-            self._adapter.process_logs([{
-                "date": datetime.datetime.now(),
-                "message": log_line
-            }])
+        # split out the different messages from the buffer
+        log_messages = [
+            (match.start(0), match.group(1))
+            for match in self._time_matcher.finditer(self._stream_buffer)
+        ]
+
+        # keep track of the index in the buffer of the last processed message. This will later help
+        # to clear the buffer from processed messages
+        next_message_start = 0
+
+        # flush indicates that all the buffer should be emptied
+        for index, log_message in enumerate(log_messages[:-1 if not flush else None]):
+
+            # determine if it is the last log message (this can only occur during a flush operation)
+            is_last_entry = len(log_messages) - 1 == index
+            next_message_start = \
+                log_messages[index + 1][0] if not is_last_entry else len(self._stream_buffer)
+
+            # if it is not the last log record read the message until the next one else if it is the
+            # last log entry read to the end of the buffer and consider it as a complete message
+            self._logs_buffer.append({
+                "date": parse(log_message[1]),
+                "message": self._stream_buffer[
+                    log_message[0] + len(log_message[1]) + 1:next_message_start - 1
+                ]
+            })
+
+        # clear the buffer from all the processed messages
+        self._stream_buffer = self._stream_buffer[next_message_start:]
+
+        # send all the log messages to the adapter to do whatever operation is required
+        self._adapter.process_logs(self._logs_buffer)
+        self._logs_buffer = []
 
 
 def attach_logger(container, adapter_config):
