@@ -14,14 +14,15 @@ class ConsoleAdapter(Adapter):
     def __init__(self, config):
         super(ConsoleAdapter, self).__init__(config)
 
-    def process_logs(self, logs=list()):
+    def _process_logs_batch(self, logs_batch):
 
-        # if no logs have been specified move on, no need to panic
-        if not logs:
+        # if no logs batch have been specified move on, no need to panic
+        if not logs_batch:
             return
 
         # print the given logs to console
-        for log in logs:
+        for log in logs_batch:
+            # print the log entry to console
             print(
                 "{container_name}: {date} - {message}".format(
                     container_name=self._config.get("container_name", "Unknown"),

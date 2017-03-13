@@ -38,17 +38,18 @@ class DockerLogCapture(Thread):
         self._log = logging.getLogger(__name__)
         self._container = container
         self._adapter = adapter
-        self._time_matcher = re.compile(r"(\d{4}(?:-\d{2}){2}T\d{2}(?::\d{2}){2}\.\d{9}[A-Z])+\s")
-        self._stream_buffer = ""
-        self._logs_buffer = []
-        self._flush_timer = None
+        self._log_date_regex_matcher = re.compile(
+            r"(\d{4}(?:-\d{2}){2}T\d{2}(?::\d{2}){2}\.\d{9}[A-Z])+\s"
+        )
+        self._logs_flush_timer = None
+        self._logs_stream_buffer = ""
 
     def run(self):
 
         try:
 
             self._log.debug(
-                "Starting Docker log capture for container {}".format(self._container.name)
+                "Starting Docker log capture for container '{}'".format(self._container.name)
             )
 
             start_from = parse("2017-03-09T12:42:20.338139139Z")
@@ -68,7 +69,7 @@ class DockerLogCapture(Thread):
 
         except KeyboardInterrupt:
             self._log.debug(
-                "Shutting Docker log capture for container {}".format(self._container.name)
+                "Shutting Docker log capture for container '{}'".format(self._container.name)
             )
 
         finally:
@@ -78,18 +79,18 @@ class DockerLogCapture(Thread):
             self._process_log_stream(flush=True)
 
             self._log.debug(
-                "Docker log capture for container {} stopped".format(self._container.name)
+                "Docker log capture for container '{}' stopped".format(self._container.name)
             )
 
     def _cancel_log_flush(self):
-        if self._flush_timer:
-            self._flush_timer.cancel()
-            self._flush_timer = None
+        if self._logs_flush_timer:
+            self._logs_flush_timer.cancel()
+            self._logs_flush_timer = None
 
     def _trigger_log_flush(self):
-        if not self._flush_timer:
-            self._flush_timer = Timer(0.2, self._process_log_stream, kwargs={"flush": True})
-            self._flush_timer.start()
+        if not self._logs_flush_timer:
+            self._logs_flush_timer = Timer(0.2, self._process_log_stream, kwargs={"flush": True})
+            self._logs_flush_timer.start()
 
     def _process_log_stream(self, chars="", flush=False):
         """
@@ -99,41 +100,41 @@ class DockerLogCapture(Thread):
         """
 
         # append the last received characters to the buffer
-        self._stream_buffer += chars
+        self._logs_stream_buffer += chars
 
-        # split out the different messages from the buffer
-        log_messages = [
+        # find the log dates to determine where each log starts and where it ends
+        log_start_pos = [
             (match.start(0), match.group(1))
-            for match in self._time_matcher.finditer(self._stream_buffer)
+            for match in self._log_date_regex_matcher.finditer(self._logs_stream_buffer)
         ]
 
-        # keep track of the index in the buffer of the last processed message. This will later help
-        # to clear the buffer from processed messages
-        next_message_start = 0
+        # keep track of the index in the buffer of the last processed log. This will later help to
+        # clear the buffer from processed logs
+        next_log_start_pos = 0
 
-        # flush indicates that all the buffer should be emptied
-        for index, log_message in enumerate(log_messages[:-1 if not flush else None]):
+        # flush indicates that all the buffer should be emptied, that is the last log in the buffer
+        # will be considered complete. If the flush flag is false, then the last message could not
+        # be considered complete so the last log will not be processed and left for further
+        # character appends processing
+        for index, log_message in enumerate(log_start_pos[:-1 if not flush else None]):
 
-            # determine if it is the last log message (this can only occur during a flush operation)
-            is_last_entry = len(log_messages) - 1 == index
-            next_message_start = \
-                log_messages[index + 1][0] if not is_last_entry else len(self._stream_buffer)
+            # determine if it is the last log (this can only occur during a flush operation)
+            is_last_entry = len(log_start_pos) - 1 == index
+            next_log_start_pos = \
+                log_start_pos[index + 1][0] if not is_last_entry else len(self._logs_stream_buffer)
 
-            # if it is not the last log record read the message until the next one else if it is the
-            # last log entry read to the end of the buffer and consider it as a complete message
-            self._logs_buffer.append({
-                "date": parse(log_message[1]),
-                "message": self._stream_buffer[
-                    log_message[0] + len(log_message[1]) + 1:next_message_start - 1
+            # if it is not the last log record read the characters until the next log start pos else
+            # if it is the last log entry read to the end of the buffer and consider it as a
+            # complete log. Pass the log entry to the adapter to be consumed
+            self._adapter.consume_log(
+                date=parse(log_message[1]),
+                message=self._logs_stream_buffer[
+                    log_message[0] + len(log_message[1]) + 1:next_log_start_pos - 1
                 ]
-            })
+            )
 
-        # clear the buffer from all the processed messages
-        self._stream_buffer = self._stream_buffer[next_message_start:]
-
-        # send all the log messages to the adapter to do whatever operation is required
-        self._adapter.process_logs(self._logs_buffer)
-        self._logs_buffer = []
+        # clear the buffer from all the processed logs
+        self._logs_stream_buffer = self._logs_stream_buffer[next_log_start_pos:]
 
 
 def attach_logger(container, adapter_config):

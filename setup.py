@@ -33,7 +33,8 @@ setup(
         'docker~=2.0',
         'pyYAML~=3.11',
         'enum34~=1.1',
-        'python-dateutil~=2.6'
+        'python-dateutil~=2.6',
+        'boto3~=1.4'
     ],
 
     # List additional groups of dependencies here (e.g. development
